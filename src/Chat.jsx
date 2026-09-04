@@ -1,40 +1,420 @@
-import { useState, useEffect, useRef } from 'react'
+       import { useState, useEffect, useRef } from 'react'
 import { supabase } from './supabaseClient'
 
 const EMOJIS = ['👍', '❤️', '😂', '😮', '😢', '🙏']
 
 export default function Chat({ session, conversationId, onBack }) {
   const [messages, setMessages] = useState([])
-    const [newMessage, setNewMessage] = useState('')
-      const [profiles, setProfiles] = useState({})
-        const [readReceipts, setReadReceipts] = useState({})
-          const [reactions, setReactions] = useState({})
-            const [openEmojiPickerFor, setOpenEmojiPickerFor] = useState(null)
-              const [replyingTo, setReplyingTo] = useState(null)
-                const bottomRef = useRef(null)
+  const [newMessage, setNewMessage] = useState('')
+  const [profiles, setProfiles] = useState({})
+  const [readReceipts, setReadReceipts] = useState({})
+  const [reactions, setReactions] = useState({})
+  const [openEmojiPickerFor, setOpenEmojiPickerFor] = useState(null)
+  const [replyingTo, setReplyingTo] = useState(null)
+  const bottomRef = useRef(null)
 
-                  useEffect(() => {
-                      fetchMessages()
-                          fetchParticipantProfiles()
-                              fetchReactions()
+  useEffect(() => {
+    fetchMessages()
+    fetchParticipantProfiles()
+    fetchReactions()
 
-                                  const messagesChannel = supabase
-                                        .channel('messages-channel-' + conversationId)
-                                              .on(
-                                                      'postgres_changes',
-                                                              { event: 'INSERT', schema: 'public', table: 'messages', filter: `conversation_id=eq.${conversationId}` },
-                                                                      (payload) => {
-                                                                                setMessages((prev) => [...prev, payload.new])
-                                                                                          markAsRead(payload.new.id)
-                                                                                                  }
-                                                                                                        )
-                                                                                                              .subscribe()
+    const messagesChannel = supabase
+      .channel('messages-channel-' + conversationId)
+      .on(
+        'postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'messages', filter: `conversation_id=eq.${conversationId}` },
+        (payload) => {
+          setMessages((prev) => [...prev, payload.new])
+          markAsRead(payload.new.id)
+        }
+      )
+      .on(
+        'postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'messages', filter: `conversation_id=eq.${conversationId}` },
+        (payload) => {
+          setMessages((prev) => prev.map((m) => (m.id === payload.new.id ? payload.new : m)))
+        }
+      )
+      .subscribe()
 
-                                                                                                                  const readsChannel = supabase
-                                                                                                                        .channel('reads-channel-' + conversationId)
-                                                                                                                              .on(
-                                                                                                                                      'postgres_changes',
-                                                                                                                                              { event: 'INSERT', schema: 'public', table: 'message_reads' },
+    const readsChannel = supabase
+      .channel('reads-channel-' + conversationId)
+      .on(
+        'postgres_changes',
+        { event: 'INSERT', schema: 'public', table: 'message_reads' },
+        (payload) => {
+          setReadReceipts((prev) => ({
+            ...prev,
+            [payload.new.message_id]: [...(prev[payload.new.message_id] || []), payload.new.user_id]
+          }))
+        }
+      )
+      .subscribe()
+
+    const reactionsChannel = supabase
+      .channel('reactions-channel-' + conversationId)
+      .on(
+        'postgres_changes',
+        { event: '*', schema: 'public', table: 'message_reactions' },
+        () => {
+          fetchReactions()
+        }
+      )
+      .subscribe()
+
+    return () => {
+      supabase.removeChannel(messagesChannel)
+      supabase.removeChannel(readsChannel)
+      supabase.removeChannel(reactionsChannel)
+    }
+  }, [conversationId])
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [messages])
+
+  const fetchParticipantProfiles = async () => {
+    const { data: participants, error: partError } = await supabase
+      .from('conversation_participants')
+      .select('user_id')
+      .eq('conversation_id', conversationId)
+
+    if (partError || !participants) return
+
+    const userIds = participants.map((p) => p.user_id)
+
+    const { data: profilesData, error: profError } = await supabase
+      .from('profiles')
+      .select('id, username, display_name')
+      .in('id', userIds)
+
+    if (profError || !profilesData) return
+
+    const profilesMap = {}
+    profilesData.forEach((p) => {
+      profilesMap[p.id] = p.display_name || p.username
+    })
+    setProfiles(profilesMap)
+  }
+
+  const fetchMessages = async () => {
+    const { data, error } = await supabase
+      .from('messages')
+      .select('*')
+      .eq('conversation_id', conversationId)
+      .order('created_at', { ascending: true })
+
+    if (error) {
+      alert('Erreur de chargement : ' + error.message)
+      return
+    }
+
+    setMessages(data)
+
+    const messageIds = data.map((m) => m.id)
+    if (messageIds.length > 0) {
+      const { data: reads } = await supabase
+        .from('message_reads')
+        .select('message_id, user_id')
+        .in('message_id', messageIds)
+
+      if (reads) {
+        const receiptsMap = {}
+        reads.forEach((r) => {
+          if (!receiptsMap[r.message_id]) receiptsMap[r.message_id] = []
+          receiptsMap[r.message_id].push(r.user_id)
+        })
+        setReadReceipts(receiptsMap)
+      }
+    }
+
+    data.forEach((msg) => {
+      if (msg.sender_id !== session.user.id) {
+        markAsRead(msg.id)
+      }
+    })
+  }
+
+  const fetchReactions = async () => {
+    const { data: msgs } = await supabase
+      .from('messages')
+      .select('id')
+      .eq('conversation_id', conversationId)
+
+    if (!msgs) return
+    const messageIds = msgs.map((m) => m.id)
+    if (messageIds.length === 0) return
+
+    const { data, error } = await supabase
+      .from('message_reactions')
+      .select('message_id, user_id, emoji')
+      .in('message_id', messageIds)
+
+    if (error || !data) return
+
+    const reactionsMap = {}
+    data.forEach((r) => {
+      if (!reactionsMap[r.message_id]) reactionsMap[r.message_id] = []
+      reactionsMap[r.message_id].push({ userId: r.user_id, emoji: r.emoji })
+    })
+    setReactions(reactionsMap)
+  }
+
+  const markAsRead = async (messageId) => {
+    await supabase.from('message_reads').upsert(
+      { message_id: messageId, user_id: session.user.id },
+      { onConflict: 'message_id,user_id' }
+    )
+  }
+
+  const sendMessage = async (e) => {
+    e.preventDefault()
+    if (!newMessage.trim()) return
+
+    const { error } = await supabase.from('messages').insert({
+      conversation_id: conversationId,
+      sender_id: session.user.id,
+      content: newMessage,
+      reply_to_id: replyingTo ? replyingTo.id : null
+    })
+
+    if (error) {
+      alert('Erreur : ' + error.message)
+    } else {
+      setNewMessage('')
+      setReplyingTo(null)
+    }
+  }
+
+  const deleteMessage = async (messageId) => {
+    const { error } = await supabase
+      .from('messages')
+      .update({ is_deleted: true })
+      .eq('id', messageId)
+
+    if (error) {
+      alert('Erreur suppression : ' + error.message)
+    }
+  }
+
+  const toggleReaction = async (messageId, emoji) => {
+    const existing = (reactions[messageId] || []).find(
+      (r) => r.userId === session.user.id && r.emoji === emoji
+    )
+
+    if (existing) {
+      await supabase
+        .from('message_reactions')
+        .delete()
+        .eq('message_id', messageId)
+        .eq('user_id', session.user.id)
+        .eq('emoji', emoji)
+    } else {
+      await supabase.from('message_reactions').insert({
+        message_id: messageId,
+        user_id: session.user.id,
+        emoji
+      })
+    }
+
+    setOpenEmojiPickerFor(null)
+  }
+
+  const isReadByOthers = (messageId) => {
+    const readers = readReceipts[messageId] || []
+    return readers.some((userId) => userId !== session.user.id)
+  }
+
+  const getGroupedReactions = (messageId) => {
+    const msgReactions = reactions[messageId] || []
+    const grouped = {}
+    msgReactions.forEach((r) => {
+      grouped[r.emoji] = (grouped[r.emoji] || 0) + 1
+    })
+    return grouped
+  }
+
+  const getMessageById = (id) => messages.find((m) => m.id === id)
+
+  return (
+    <div style={{ maxWidth: 500, margin: '0 auto', padding: 20 }}>
+      <button onClick={onBack} style={{ marginBottom: 10 }}>← Retour</button>
+      <h2>Conversation</h2>
+
+      <div style={{ border: '1px solid #ccc', borderRadius: 8, height: 450, overflowY: 'auto', padding: 10, marginBottom: 10 }}>
+        {messages.map((msg) => {
+          const isMine = msg.sender_id === session.user.id
+          const senderName = profiles[msg.sender_id] || '...'
+          const read = isReadByOthers(msg.id)
+          const groupedReactions = getGroupedReactions(msg.id)
+          const repliedMsg = msg.reply_to_id ? getMessageById(msg.reply_to_id) : null
+
+          if (msg.is_deleted) {
+            return (
+              <div
+                key={msg.id}
+                style={{
+                  textAlign: isMine ? 'right' : 'left',
+                  marginBottom: 12
+                }}
+              >
+                {!isMine && (
+                  <div style={{ fontSize: 12, color: '#888', marginBottom: 2 }}>
+                    {senderName}
+                  </div>
+                )}
+                <span
+                  style={{
+                    display: 'inline-block',
+                    background: '#f0f0f0',
+                    padding: '6px 12px',
+                    borderRadius: 12,
+                    fontStyle: 'italic',
+                    color: '#999'
+                  }}
+                >
+                  🚫 Message supprimé
+                </span>
+              </div>
+            )
+          }
+
+          return (
+            <div
+              key={msg.id}
+              style={{
+                textAlign: isMine ? 'right' : 'left',
+                marginBottom: 12
+              }}
+            >
+              {!isMine && (
+                <div style={{ fontSize: 12, color: '#888', marginBottom: 2 }}>
+                  {senderName}
+                </div>
+              )}
+
+              {repliedMsg && (
+                <div
+                  style={{
+                    fontSize: 12,
+                    color: '#555',
+                    background: '#e8e8e8',
+                    borderLeft: '3px solid #999',
+                    padding: '4px 8px',
+                    borderRadius: 6,
+                    marginBottom: 2,
+                    display: 'inline-block',
+                    maxWidth: '80%'
+                  }}
+                >
+                  {profiles[repliedMsg.sender_id] || '...'}: {repliedMsg.is_deleted ? 'Message supprimé' : repliedMsg.content}
+                </div>
+              )}
+              <br />
+
+              <span
+                onClick={() => setOpenEmojiPickerFor(openEmojiPickerFor === msg.id ? null : msg.id)}
+                style={{
+                  display: 'inline-block',
+                  background: isMine ? '#DCF8C6' : '#F1F0F0',
+                  padding: '6px 12px',
+                  borderRadius: 12,
+                  cursor: 'pointer'
+                }}
+              >
+                {msg.content}
+              </span>
+
+              <div>
+                <button
+                  onClick={() => setReplyingTo(msg)}
+                  style={{ fontSize: 11, border: 'none', background: 'none', color: '#666', cursor: 'pointer' }}
+                >
+                  ↩️ Répondre
+                </button>
+                {isMine && (
+                  <button
+                    onClick={() => deleteMessage(msg.id)}
+                    style={{ fontSize: 11, border: 'none', background: 'none', color: '#c00', cursor: 'pointer', marginLeft: 8 }}
+                  >
+                    🗑️ Supprimer
+                  </button>
+                )}
+              </div>
+
+              {Object.keys(groupedReactions).length > 0 && (
+                <div style={{ fontSize: 13, marginTop: 2 }}>
+                  {Object.entries(groupedReactions).map(([emoji, count]) => (
+                    <span key={emoji} style={{ marginRight: 4 }}>
+                      {emoji} {count > 1 ? count : ''}
+                    </span>
+                  ))}
+                </div>
+              )}
+
+              {openEmojiPickerFor === msg.id && (
+                <div style={{ marginTop: 4 }}>
+                  {EMOJIS.map((emoji) => (
+                    <button
+                      key={emoji}
+                      onClick={() => toggleReaction(msg.id, emoji)}
+                      style={{ fontSize: 18, margin: '0 2px', border: 'none', background: 'none', cursor: 'pointer' }}
+                    >
+                      {emoji}
+                    </button>
+                  ))}
+                </div>
+              )}
+
+              {isMine && (
+                <div style={{ fontSize: 11, color: read ? '#4FC3F7' : '#999', marginTop: 2 }}>
+                  {read ? '✓✓ Lu' : '✓ Envoyé'}
+                </div>
+              )}
+            </div>
+          )
+        })}
+        <div ref={bottomRef} />
+      </div>
+
+      {replyingTo && (
+        <div
+          style={{
+            background: '#f0f0f0',
+            borderLeft: '3px solid #4FC3F7',
+            padding: '6px 10px',
+            marginBottom: 8,
+            display: 'flex',
+            justifyContent: 'space-between',
+            alignItems: 'center',
+            fontSize: 13
+          }}
+        >
+          <span>
+            Réponse à {profiles[replyingTo.sender_id] || '...'}: {replyingTo.content}
+          </span>
+          <button
+            onClick={() => setReplyingTo(null)}
+            style={{ border: 'none', background: 'none', cursor: 'pointer', fontSize: 16 }}
+          >
+            ✕
+          </button>
+        </div>
+      )}
+
+      <form onSubmit={sendMessage} style={{ display: 'flex', gap: 8 }}>
+        <input
+          type="text"
+          value={newMessage}
+          onChange={(e) => setNewMessage(e.target.value)}
+          placeholder="Écris un message..."
+          style={{ flex: 1, padding: 8 }}
+        />
+        <button type="submit">Envoyer</button>
+      </form>
+    </div>
+  )
+      }                                                                                                                                       { event: 'INSERT', schema: 'public', table: 'message_reads' },
                                                                                                                                                       (payload) => {
                                                                                                                                                                 setReadReceipts((prev) => ({
                                                                                                                                                                             ...prev,
