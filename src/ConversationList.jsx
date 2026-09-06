@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { supabase } from './supabaseClient'
 
-export default function ConversationList({ session, onSelectConversation }) {
+export default function ConversationList({ session: _session, onSelectConversation }) {
   const [conversations, setConversations] = useState([])
     const [searchUsername, setSearchUsername] = useState('')
       const [loading, setLoading] = useState(true)
